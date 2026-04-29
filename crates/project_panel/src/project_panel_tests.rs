@@ -8,7 +8,10 @@ use pretty_assertions::assert_eq;
 use project::{FakeFs, ProjectPath, RemoveOptions};
 use serde_json::json;
 use settings::{ProjectPanelAutoOpenSettings, SettingsStore};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use util::{path, paths::PathStyle, rel_path::rel_path};
 use workspace::{
     AppState, ItemHandle, MultiWorkspace, Pane, Workspace,
@@ -198,6 +201,58 @@ async fn test_focus_rescans_expanded_directories(cx: &mut gpui::TestAppContext) 
             "          keep.rs",
             "          new.rs",
         ]
+    );
+}
+
+#[gpui::test]
+async fn test_polling_rescans_scanned_directories(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/src"),
+        json!({
+            "dir": {
+                "old.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/src").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    toggle_expand_dir(&panel, "src/dir", cx);
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &["v src", "    v dir  <== selected", "          old.rs"]
+    );
+
+    fs.pause_events();
+    fs.insert_file(path!("/src/dir/new.rs"), Vec::new()).await;
+    fs.remove_file(
+        Path::new("/src/dir/old.rs"),
+        RemoveOptions {
+            recursive: false,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    fs.clear_buffered_events();
+
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &["v src", "    v dir  <== selected", "          new.rs"]
     );
 }
 

@@ -77,6 +77,7 @@ pub use worktree_settings::WorktreeSettings;
 use crate::ignore::IgnoreKind;
 
 pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
+const SCANNED_DIR_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A set of local or remote files that are being opened as part of a project.
 /// Responsible for tracking related FS (for local)/collab (for remote) events and corresponding updates.
@@ -4201,6 +4202,8 @@ impl BackgroundScanner {
 
         // Continue processing events until the worktree is dropped.
         self.phase = BackgroundScannerPhase::Events;
+        let poll_scanned_dirs_timer = self.poll_scanned_dirs_timer().fuse();
+        futures::pin_mut!(poll_scanned_dirs_timer);
 
         loop {
             select_biased! {
@@ -4245,6 +4248,11 @@ impl BackgroundScanner {
                     self.process_events(paths.into_iter().filter(|event| event.kind.is_some()).collect()).await;
                 }
 
+                _ = poll_scanned_dirs_timer => {
+                    self.poll_scanned_dirs().await;
+                    poll_scanned_dirs_timer.set(self.poll_scanned_dirs_timer().fuse());
+                }
+
                 _ = global_gitignore_events.next().fuse() => {
                     if let Some(path) = &global_gitignore_file {
                         self.update_global_gitignore(&path).await;
@@ -4252,6 +4260,34 @@ impl BackgroundScanner {
                 }
             }
         }
+    }
+
+    async fn poll_scanned_dirs(&self) {
+        let mut directory_paths = {
+            let state = self.state.lock().await;
+            state
+                .scanned_dirs
+                .iter()
+                .filter_map(|entry_id| state.snapshot.entry_for_id(*entry_id))
+                .filter(|entry| entry.is_dir())
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>()
+        };
+        directory_paths.sort_unstable();
+        directory_paths.dedup();
+        if directory_paths.is_empty() {
+            return;
+        }
+
+        self.process_scan_request(
+            ScanRequest {
+                relative_paths: Vec::new(),
+                directory_paths,
+                done: SmallVec::new(),
+            },
+            false,
+        )
+        .await;
     }
 
     async fn process_scan_request(&self, mut request: ScanRequest, scanning: bool) -> bool {
@@ -5652,6 +5688,10 @@ impl BackgroundScanner {
             });
 
         affected_repo_roots
+    }
+
+    async fn poll_scanned_dirs_timer(&self) {
+        self.executor.timer(SCANNED_DIR_POLL_INTERVAL).await
     }
 
     async fn progress_timer(&self, running: bool) {
