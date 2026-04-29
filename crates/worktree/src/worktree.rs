@@ -78,6 +78,7 @@ use crate::ignore::IgnoreKind;
 
 pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
 const SCANNED_DIR_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SCANNED_DIR_POLL_BUDGET: usize = 100;
 
 /// A set of local or remote files that are being opened as part of a project.
 /// Responsible for tracking related FS (for local)/collab (for remote) events and corresponding updates.
@@ -273,6 +274,7 @@ struct BackgroundScannerState {
     /// path is re-created after being deleted.
     removed_entries: HashMap<u64, Entry>,
     changed_paths: Vec<Arc<RelPath>>,
+    next_scanned_dir_poll_index: usize,
     prev_snapshot: Snapshot,
     scanning_enabled: bool,
 }
@@ -1208,6 +1210,7 @@ impl LocalWorktree {
                         paths_to_scan: Default::default(),
                         removed_entries: Default::default(),
                         changed_paths: Default::default(),
+                        next_scanned_dir_poll_index: 0,
                     }),
                     phase: BackgroundScannerPhase::InitialScan,
                     share_private_files,
@@ -4263,21 +4266,34 @@ impl BackgroundScanner {
     }
 
     async fn poll_scanned_dirs(&self) {
-        let mut directory_paths = {
-            let state = self.state.lock().await;
-            state
+        let directory_paths = {
+            let mut state = self.state.lock().await;
+            if state.snapshot.completed_scan_id != state.snapshot.scan_id {
+                return;
+            }
+
+            let mut entries = state
                 .scanned_dirs
                 .iter()
                 .filter_map(|entry_id| state.snapshot.entry_for_id(*entry_id))
                 .filter(|entry| entry.is_dir())
-                .map(|entry| entry.path.clone())
-                .collect::<Vec<_>>()
+                .map(|entry| (entry.id, entry.path.clone()))
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(entry_id, _)| *entry_id);
+            entries.dedup_by_key(|(entry_id, _)| *entry_id);
+            if entries.is_empty() {
+                state.next_scanned_dir_poll_index = 0;
+                return;
+            }
+
+            let start_index = state.next_scanned_dir_poll_index % entries.len();
+            let count = entries.len().min(SCANNED_DIR_POLL_BUDGET);
+            let paths = (0..count)
+                .map(|offset| entries[(start_index + offset) % entries.len()].1.clone())
+                .collect::<Vec<_>>();
+            state.next_scanned_dir_poll_index = (start_index + count) % entries.len();
+            paths
         };
-        directory_paths.sort_unstable();
-        directory_paths.dedup();
-        if directory_paths.is_empty() {
-            return;
-        }
 
         self.process_scan_request(
             ScanRequest {
