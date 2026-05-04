@@ -257,6 +257,54 @@ async fn test_polling_rescans_scanned_directories(cx: &mut gpui::TestAppContext)
 }
 
 #[gpui::test]
+async fn test_polling_removes_deleted_scanned_directory(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/src"),
+        json!({
+            "dir": {
+                "file.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/src").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    toggle_expand_dir(&panel, "src/dir", cx);
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &["v src", "    v dir  <== selected", "          file.rs",]
+    );
+
+    fs.pause_events();
+    fs.remove_dir(
+        Path::new("/src/dir"),
+        RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    fs.clear_buffered_events();
+
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+
+    assert_eq!(visible_entries_as_strings(&panel, 0..10, cx), &["v src"]);
+}
+
+#[gpui::test]
 async fn test_opening_file(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
 

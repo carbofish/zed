@@ -3035,6 +3035,33 @@ impl BackgroundScannerState {
                 .any(|p| entry.path.starts_with(p))
     }
 
+    fn next_scanned_dir_poll_paths(&mut self) -> Option<Vec<Arc<RelPath>>> {
+        if self.snapshot.completed_scan_id != self.snapshot.scan_id {
+            return None;
+        }
+
+        let mut entries = self
+            .scanned_dirs
+            .iter()
+            .filter_map(|entry_id| self.snapshot.entry_for_id(*entry_id))
+            .filter(|entry| entry.is_dir())
+            .map(|entry| (entry.id, entry.path.clone()))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(entry_id, _)| *entry_id);
+        if entries.is_empty() {
+            self.next_scanned_dir_poll_index = 0;
+            return None;
+        }
+
+        let start_index = self.next_scanned_dir_poll_index % entries.len();
+        let count = entries.len().min(SCANNED_DIR_POLL_BUDGET);
+        let paths = (0..count)
+            .map(|offset| entries[(start_index + offset) % entries.len()].1.clone())
+            .collect::<Vec<_>>();
+        self.next_scanned_dir_poll_index = (start_index + count) % entries.len();
+        Some(paths)
+    }
+
     async fn enqueue_scan_dir(
         &self,
         abs_path: Arc<Path>,
@@ -4266,33 +4293,8 @@ impl BackgroundScanner {
     }
 
     async fn poll_scanned_dirs(&self) {
-        let directory_paths = {
-            let mut state = self.state.lock().await;
-            if state.snapshot.completed_scan_id != state.snapshot.scan_id {
-                return;
-            }
-
-            let mut entries = state
-                .scanned_dirs
-                .iter()
-                .filter_map(|entry_id| state.snapshot.entry_for_id(*entry_id))
-                .filter(|entry| entry.is_dir())
-                .map(|entry| (entry.id, entry.path.clone()))
-                .collect::<Vec<_>>();
-            entries.sort_unstable_by_key(|(entry_id, _)| *entry_id);
-            entries.dedup_by_key(|(entry_id, _)| *entry_id);
-            if entries.is_empty() {
-                state.next_scanned_dir_poll_index = 0;
-                return;
-            }
-
-            let start_index = state.next_scanned_dir_poll_index % entries.len();
-            let count = entries.len().min(SCANNED_DIR_POLL_BUDGET);
-            let paths = (0..count)
-                .map(|offset| entries[(start_index + offset) % entries.len()].1.clone())
-                .collect::<Vec<_>>();
-            state.next_scanned_dir_poll_index = (start_index + count) % entries.len();
-            paths
+        let Some(directory_paths) = self.state.lock().await.next_scanned_dir_poll_paths() else {
+            return;
         };
 
         self.process_scan_request(
@@ -6705,6 +6707,106 @@ fn decode_byte_full(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_metadata(is_dir: bool, inode: u64) -> fs::Metadata {
+        fs::Metadata {
+            inode,
+            mtime: MTime::from_seconds_and_nanos(0, 0),
+            is_symlink: false,
+            is_dir,
+            len: 0,
+            is_fifo: false,
+            is_executable: false,
+        }
+    }
+
+    fn insert_test_entry(snapshot: &mut Snapshot, id: ProjectEntryId, path: Arc<RelPath>) {
+        let metadata = test_metadata(true, id.to_usize() as u64);
+        let mut entry = Entry::new(path, &metadata, id, snapshot.root_char_bag, None);
+        entry.kind = EntryKind::Dir;
+        snapshot
+            .entries_by_path
+            .insert_or_replace(entry.clone(), ());
+        snapshot.entries_by_id.insert_or_replace(
+            PathEntry {
+                id,
+                path: entry.path.clone(),
+                is_ignored: false,
+                scan_id: snapshot.scan_id,
+            },
+            (),
+        );
+    }
+
+    fn test_scanner_state(dir_count: usize) -> BackgroundScannerState {
+        let mut snapshot = Snapshot::new(
+            WorktreeId::from_usize(1),
+            RelPath::unix("root").unwrap().into(),
+            Arc::from(Path::new("/root")),
+            PathStyle::Posix,
+        );
+        snapshot.completed_scan_id = snapshot.scan_id;
+        let mut scanned_dirs = HashSet::default();
+        for ix in 0..dir_count {
+            let id = ProjectEntryId::from_usize(ix);
+            let path = RelPath::unix(&format!("dir_{ix:03}")).unwrap().into();
+            insert_test_entry(&mut snapshot, id, path);
+            scanned_dirs.insert(id);
+        }
+
+        BackgroundScannerState {
+            snapshot: LocalSnapshot {
+                snapshot,
+                global_gitignore: Default::default(),
+                repo_exclude_by_work_dir_abs_path: Default::default(),
+                ignores_by_parent_abs_path: Default::default(),
+                git_repositories: Default::default(),
+                root_file_handle: None,
+            },
+            symlink_paths_by_target: Default::default(),
+            scanned_dirs,
+            watched_dir_abs_paths_by_entry_id: Default::default(),
+            path_prefixes_to_scan: Default::default(),
+            paths_to_scan: Default::default(),
+            removed_entries: Default::default(),
+            changed_paths: Default::default(),
+            next_scanned_dir_poll_index: 0,
+            prev_snapshot: Snapshot::new(
+                WorktreeId::from_usize(1),
+                RelPath::unix("root").unwrap().into(),
+                Arc::from(Path::new("/root")),
+                PathStyle::Posix,
+            ),
+            scanning_enabled: true,
+        }
+    }
+
+    #[test]
+    fn test_scanned_dir_poll_paths_respect_budget_and_round_robin() {
+        let mut state = test_scanner_state(SCANNED_DIR_POLL_BUDGET + 5);
+        let first_paths = state.next_scanned_dir_poll_paths().unwrap();
+        assert_eq!(first_paths.len(), SCANNED_DIR_POLL_BUDGET);
+        assert_eq!(first_paths.first().unwrap().as_unix_str(), "dir_000");
+        assert_eq!(first_paths.last().unwrap().as_unix_str(), "dir_099");
+
+        let second_paths = state.next_scanned_dir_poll_paths().unwrap();
+        assert_eq!(second_paths.len(), SCANNED_DIR_POLL_BUDGET);
+        assert_eq!(second_paths.first().unwrap().as_unix_str(), "dir_100");
+        assert_eq!(second_paths.last().unwrap().as_unix_str(), "dir_094");
+    }
+
+    #[test]
+    fn test_scanned_dir_poll_paths_skip_when_scan_in_progress() {
+        let mut state = test_scanner_state(1);
+        state.snapshot.scan_id += 1;
+        assert!(state.next_scanned_dir_poll_paths().is_none());
+        assert_eq!(state.next_scanned_dir_poll_index, 0);
+
+        state.snapshot.completed_scan_id = state.snapshot.scan_id;
+        let paths = state.next_scanned_dir_poll_paths().unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].as_unix_str(), "dir_000");
+    }
 
     /// reproduction of issue #50785
     fn build_pcm16_wav_bytes() -> Vec<u8> {
