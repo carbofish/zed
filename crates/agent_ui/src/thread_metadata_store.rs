@@ -20,7 +20,7 @@ use db::{
 };
 use fs::Fs;
 use futures::{FutureExt, future::Shared};
-use gpui::{AppContext as _, Entity, Global, Subscription, Task};
+use gpui::{AppContext as _, Entity, Global, Subscription, Task, WeakEntity};
 pub use project::WorktreePaths;
 use project::{AgentId, linked_worktree_short_name};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
@@ -471,7 +471,36 @@ pub struct ThreadMetadataStore {
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
+    /// Threads currently being restored from archive. Tracked globally so
+    /// only one window at a time can run the destructive restore for a
+    /// given thread; other windows surface a toast instead. Per-window
+    /// `restoring_tasks` state still exists in `Sidebar`, this is the
+    /// cross-window claim layer in front of it.
+    restoring: HashSet<ThreadId>,
     _db_operations_task: Task<()>,
+}
+
+/// RAII guard returned by [`ThreadMetadataStore::try_claim_restore`]. When
+/// dropped, schedules a `finish_restoring` call on the global store so the
+/// claim is released even on early returns or panics.
+pub struct RestoreGuard {
+    thread_id: ThreadId,
+    store: WeakEntity<ThreadMetadataStore>,
+    cx: gpui::AsyncApp,
+}
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        // `WeakEntity::update` returns an error if the entity has been
+        // released; that's fine — there's nothing to release in that case.
+        // We deliberately don't propagate the error: drops can run on any
+        // exit path and there's no caller to surface it to.
+        self.store
+            .update(&mut self.cx, |store, _| {
+                store.finish_restoring(self.thread_id);
+            })
+            .ok();
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -538,6 +567,43 @@ impl ThreadMetadataStore {
 
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalThreadMetadataStore>().0.clone()
+    }
+
+    /// Tries to mark `thread_id` as currently being restored. Returns `true`
+    /// if the claim was newly registered, `false` if some other window is
+    /// already restoring this thread. Caller MUST eventually call
+    /// `finish_restoring` (use [`RestoreGuard`] to make this automatic).
+    pub fn begin_restoring(&mut self, thread_id: ThreadId) -> bool {
+        self.restoring.insert(thread_id)
+    }
+
+    pub fn finish_restoring(&mut self, thread_id: ThreadId) {
+        self.restoring.remove(&thread_id);
+    }
+
+    pub fn is_restoring(&self, thread_id: ThreadId) -> bool {
+        self.restoring.contains(&thread_id)
+    }
+
+    /// Attempts to claim exclusive ownership of restoring `thread_id`. If
+    /// some other caller already holds a claim, returns `None` — the caller
+    /// should surface a "this thread is already being restored in another
+    /// window" message to the user. On success, the returned guard releases
+    /// the claim when dropped.
+    pub fn try_claim_restore(
+        this: &Entity<Self>,
+        thread_id: ThreadId,
+        cx: &mut gpui::AsyncApp,
+    ) -> Option<RestoreGuard> {
+        let claimed = this.update(cx, |store, _| store.begin_restoring(thread_id));
+        if !claimed {
+            return None;
+        }
+        Some(RestoreGuard {
+            thread_id,
+            store: this.downgrade(),
+            cx: cx.clone(),
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1143,6 +1209,7 @@ impl ThreadMetadataStore {
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
+            restoring: HashSet::default(),
             _db_operations_task,
         };
         let _ = this.reload(cx);
@@ -4021,5 +4088,45 @@ mod tests {
                 "retained thread A's stored path must not be updated while the project is via collab"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_try_claim_restore_is_mutually_exclusive(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let thread_id = ThreadId::new();
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+
+        let mut async_cx = cx.to_async();
+        let first_guard = ThreadMetadataStore::try_claim_restore(&store, thread_id, &mut async_cx)
+            .expect("first claim should succeed");
+
+        cx.update(|cx| {
+            assert!(
+                store.read(cx).is_restoring(thread_id),
+                "store should report the thread as being restored while a guard is alive"
+            );
+        });
+
+        let second = ThreadMetadataStore::try_claim_restore(&store, thread_id, &mut async_cx);
+        assert!(
+            second.is_none(),
+            "a second concurrent claim must be rejected while the first guard is alive"
+        );
+
+        drop(first_guard);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                !store.read(cx).is_restoring(thread_id),
+                "dropping the guard must release the claim"
+            );
+        });
+
+        let third = ThreadMetadataStore::try_claim_restore(&store, thread_id, &mut async_cx)
+            .expect("a fresh claim should succeed after the previous guard was dropped");
+        drop(third);
+        cx.run_until_parked();
     }
 }

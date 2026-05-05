@@ -2775,6 +2775,46 @@ impl Sidebar {
 
         let restore_task = cx.spawn_in(window, async move |this, cx| {
             let result: anyhow::Result<()> = async {
+                let store_entity =
+                    cx.update(|_window, cx| ThreadMetadataStore::global(cx))?;
+                let _restore_guard = match ThreadMetadataStore::try_claim_restore(
+                    &store_entity,
+                    thread_id,
+                    &mut *cx,
+                ) {
+                    Some(guard) => guard,
+                    None => {
+                        this.update_in(cx, |this, _window, cx| {
+                            this.restoring_tasks.remove(&thread_id);
+                            if let Some(weak_archive_view) = &weak_archive_view {
+                                weak_archive_view
+                                    .update(cx, |view, cx| {
+                                        view.clear_restoring(&thread_id, cx);
+                                    })
+                                    .ok();
+                            }
+
+                            if let Some(multi_workspace) = this.multi_workspace.upgrade() {
+                                let workspace = multi_workspace.read(cx).workspace().clone();
+                                workspace.update(cx, |workspace, cx| {
+                                    struct AlreadyRestoringToast;
+                                    workspace.show_toast(
+                                        Toast::new(
+                                            NotificationId::unique::<AlreadyRestoringToast>(),
+                                            "This thread is already being restored in another window."
+                                                .to_string(),
+                                        )
+                                        .autohide(),
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                        .ok();
+                        return anyhow::Ok(());
+                    }
+                };
+
                 let archived_worktrees = task.await?;
 
                 if archived_worktrees.is_empty() {
