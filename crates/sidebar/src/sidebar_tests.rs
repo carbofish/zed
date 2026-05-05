@@ -5333,6 +5333,253 @@ async fn test_restore_worktree_when_branch_does_not_exist(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn test_restore_worktree_cleans_up_backup_on_success(cx: &mut TestAppContext) {
+    // restore_worktree_via_git should move pre-existing content into a
+    // sibling backup directory before recreating the worktree, then delete
+    // that backup directory once the restore has completed successfully.
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-success": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-success",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/wt-feature-success",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-success",
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/wt-feature-success"),
+            ref_name: Some("refs/heads/feature-success".into()),
+            sha: "original-sha".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project =
+        project::Project::test(fs.clone(), ["/wt-feature-success".as_ref()], cx).await;
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, _cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    multi_workspace.update_in(_cx, |mw, window, cx| {
+        mw.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+
+    let wt_repo = worktree_project.read_with(cx, |project, cx| {
+        project.repositories(cx).values().next().unwrap().clone()
+    });
+    let (staged_hash, unstaged_hash) = cx
+        .update(|cx| wt_repo.update(cx, |repo, _| repo.create_archive_checkpoint()))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Drop a sentinel file at the worktree path that is *not* part of the
+    // archive checkpoint, simulating user content that the user agreed to
+    // overwrite when they confirmed the restore prompt.
+    fs.write(
+        Path::new("/wt-feature-success/sentinel.txt"),
+        b"pre-existing user content",
+    )
+    .await
+    .unwrap();
+
+    let result = cx
+        .spawn(|mut cx| async move {
+            agent_ui::thread_worktree_archive::restore_worktree_via_git(
+                &agent_ui::thread_metadata_store::ArchivedGitWorktree {
+                    id: 1,
+                    worktree_path: PathBuf::from("/wt-feature-success"),
+                    main_repo_path: PathBuf::from("/project"),
+                    branch_name: Some("feature-success".to_string()),
+                    staged_commit_hash: staged_hash,
+                    unstaged_commit_hash: unstaged_hash,
+                    original_commit_hash: "original-sha".to_string(),
+                },
+                None,
+                &mut cx,
+            )
+            .await
+        })
+        .await;
+
+    assert!(result.is_ok(), "restore should succeed: {:?}", result.err());
+
+    // No backup directory should remain in the parent of the worktree path.
+    let leftover_backup = fs.directories(true).into_iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".zed-restore-backup-"))
+    });
+    assert!(
+        leftover_backup.is_none(),
+        "backup directory should be deleted after a successful restore, found: {leftover_backup:?}"
+    );
+
+    // The restored worktree directory must exist (it was renamed away to a
+    // backup, then recreated by `git worktree add`).
+    assert!(
+        fs.metadata(Path::new("/wt-feature-success"))
+            .await
+            .unwrap()
+            .is_some(),
+        "worktree path should exist after a successful restore"
+    );
+}
+
+#[gpui::test]
+async fn test_restore_worktree_rolls_back_backup_on_failure(cx: &mut TestAppContext) {
+    // When restore_worktree_via_git fails partway through (here, because
+    // the archive checkpoint SHAs are bogus), it must restore the user's
+    // pre-existing content from the backup and not leave a backup
+    // directory lying around.
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-fail": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-fail",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/wt-feature-fail",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-fail",
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/wt-feature-fail"),
+            ref_name: Some("refs/heads/feature-fail".into()),
+            sha: "original-sha".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project =
+        project::Project::test(fs.clone(), ["/wt-feature-fail".as_ref()], cx).await;
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, _cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    multi_workspace.update_in(_cx, |mw, window, cx| {
+        mw.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+
+    // Drop a sentinel file representing pre-existing user content the
+    // user expected to be overwritten by the archived state on success.
+    fs.write(
+        Path::new("/wt-feature-fail/sentinel.txt"),
+        b"important user data",
+    )
+    .await
+    .unwrap();
+
+    // Bogus checkpoint SHAs will cause `restore_archive_checkpoint` to
+    // fail, exercising the rollback path.
+    let bogus_sha = "0".repeat(40);
+
+    let result = cx
+        .spawn({
+            let bogus_sha = bogus_sha.clone();
+            |mut cx| async move {
+                agent_ui::thread_worktree_archive::restore_worktree_via_git(
+                    &agent_ui::thread_metadata_store::ArchivedGitWorktree {
+                        id: 1,
+                        worktree_path: PathBuf::from("/wt-feature-fail"),
+                        main_repo_path: PathBuf::from("/project"),
+                        branch_name: Some("feature-fail".to_string()),
+                        staged_commit_hash: bogus_sha.clone(),
+                        unstaged_commit_hash: bogus_sha,
+                        original_commit_hash: "original-sha".to_string(),
+                    },
+                    None,
+                    &mut cx,
+                )
+                .await
+            }
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "restore should fail when checkpoint SHAs are bogus",
+    );
+
+    // The pre-existing sentinel must be back at the original path.
+    let sentinel_contents = fs
+        .load(Path::new("/wt-feature-fail/sentinel.txt"))
+        .await
+        .expect("sentinel file must be restored from the backup");
+    assert_eq!(
+        sentinel_contents, "important user data",
+        "sentinel content must match what was on disk before the restore",
+    );
+
+    // No backup directory should remain in the parent of the worktree path.
+    let leftover_backup = fs.directories(true).into_iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".zed-restore-backup-"))
+    });
+    assert!(
+        leftover_backup.is_none(),
+        "backup directory should be cleaned up after a rollback, found: {leftover_backup:?}"
+    );
+}
+
+#[gpui::test]
 async fn test_restore_worktree_thread_uses_main_repo_project_group_key(cx: &mut TestAppContext) {
     // Activating an archived linked worktree thread whose directory has
     // been deleted should reuse the existing main repo workspace, not

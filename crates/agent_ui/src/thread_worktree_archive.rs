@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use fs::{Fs, RemoveOptions};
+use fs::{Fs, RemoveOptions, RenameOptions};
 use gpui::{App, AsyncApp, Entity, Task};
 use project::{
     LocalProjectFlags, Project, WorktreeId,
@@ -559,11 +559,14 @@ pub async fn rollback_persist(archived_worktree_id: i64, root: &RootPlan, cx: &m
 /// unstaged state from the WIP commit trees.
 ///
 /// **Destructive**: the final step (`restore_archive_checkpoint`) clobbers the
-/// working directory unconditionally via `git read-tree --reset -u`, and this
-/// function deletes any pre-existing directory at `worktree_path` before
-/// recreating it. Callers must use [`worktree_path_has_content`] first to
-/// detect any content the user might lose, and prompt for confirmation before
-/// invoking this function.
+/// working directory unconditionally via `git read-tree --reset -u`. Any
+/// pre-existing entry at `worktree_path` is moved aside into a sibling
+/// `.zed-restore-backup-<uuid>` directory before the rest of the destructive
+/// work runs. If a later step fails, the backup is moved back over
+/// `worktree_path` so the user does not lose their content. On success the
+/// backup directory is deleted. Callers must still use
+/// [`worktree_path_has_content`] first to detect any content the user might
+/// overwrite, and prompt for confirmation before invoking this function.
 pub async fn restore_worktree_via_git(
     row: &ArchivedGitWorktree,
     remote_connection: Option<&RemoteConnectionOptions>,
@@ -578,42 +581,73 @@ pub async fn restore_worktree_via_git(
     // Always restore by recreating the worktree from scratch. This collapses
     // every messy intermediate state into one clean flow:
     //
-    //   - Directory missing, no registration:           plain add.
-    //   - Directory missing, stale registration:        scoped remove → add.
-    //   - Directory leftover, no registration
-    //     (the original Windows file-lock bug):         delete → add.
-    //   - Directory leftover, stale registration:       delete → scoped remove → add.
-    //   - Directory exists as a fully valid worktree:   delete → scoped remove → add.
+    //   - Path missing, no registration:               plain add.
+    //   - Path missing, stale registration:            scoped remove → add.
+    //   - Path present (any kind), no registration
+    //     (the original Windows file-lock bug):        rename → add.
+    //   - Path present, stale registration:            rename → scoped remove → add.
+    //   - Path present as a fully valid worktree:      rename → scoped remove → add.
     //
-    // Deleting first is safe because the caller is required to gate user
-    // content behind a confirmation prompt (see `worktree_path_has_content`),
-    // and the staged/unstaged WIP commits capture everything we need to
-    // restore the working tree state.
-    if let Some(metadata) = app_state.fs.metadata(worktree_path).await? {
-        let remove_options = RemoveOptions {
-            recursive: true,
-            ignore_if_not_exists: true,
-        };
-        // The path is normally a directory, but a stray regular file (or
-        // symlink) can happen if something went wrong in a previous archive
-        // or the user manually replaced the worktree. `remove_dir` would
-        // fail with ENOTDIR in that case, so dispatch on the actual entry
-        // type.
-        let result = if metadata.is_dir {
-            app_state.fs.remove_dir(worktree_path, remove_options).await
-        } else {
-            app_state
-                .fs
-                .remove_file(worktree_path, remove_options)
-                .await
-        };
-        result.with_context(|| {
+    // Any pre-existing entry at `worktree_path` is moved aside into a
+    // sibling backup directory rather than deleted up-front. If any of the
+    // destructive steps below fail, [`rollback_backup`] restores the
+    // backup over `worktree_path` so the user does not lose content they
+    // confirmed they wanted overwritten only on the assumption that the
+    // archived state would replace it. On success the backup is deleted at
+    // the end of this function.
+    let backup = if app_state.fs.metadata(worktree_path).await?.is_some() {
+        // Place the backup directory next to `worktree_path` so the rename
+        // stays on the same filesystem and is therefore atomic. If the
+        // worktree path has no parent (e.g. it is the filesystem root),
+        // there is nowhere to put the backup and we have to bail out
+        // before doing anything destructive.
+        let parent = worktree_path.parent().with_context(|| {
             format!(
-                "failed to delete existing worktree path '{}'",
+                "worktree path '{}' has no parent directory to host a rollback backup",
                 worktree_path.display()
             )
         })?;
-    }
+        let backup_dir = parent.join(format!(".zed-restore-backup-{}", uuid::Uuid::new_v4()));
+        app_state
+            .fs
+            .create_dir(&backup_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create backup directory '{}'",
+                    backup_dir.display()
+                )
+            })?;
+        let backup_target = backup_dir.join("worktree");
+        // `rename` works for both directories and files, so we don't need
+        // to dispatch on the entry kind. A stray regular file or symlink
+        // at `worktree_path` is moved aside the same way as a directory.
+        app_state
+            .fs
+            .rename(
+                worktree_path,
+                &backup_target,
+                RenameOptions {
+                    overwrite: false,
+                    ignore_if_exists: false,
+                    create_parents: false,
+                },
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to move existing path '{}' to backup '{}'",
+                    worktree_path.display(),
+                    backup_target.display()
+                )
+            })?;
+        Some(Backup {
+            dir: backup_dir,
+            target: backup_target,
+        })
+    } else {
+        None
+    };
 
     // Clean up any stale registration in the main repo that points at the
     // (now missing) worktree path. Without this, `git worktree add` would
@@ -646,10 +680,24 @@ pub async fn restore_worktree_via_git(
     let create_rx = main_repo.update(cx, |repo, _cx| {
         repo.create_worktree_detached(worktree_path.clone(), row.original_commit_hash.clone())
     });
-    create_rx
-        .await
-        .map_err(|_| anyhow!("worktree creation was canceled"))?
-        .context("failed to create worktree")?;
+    let create_result = match create_rx.await {
+        Ok(result) => result.context("failed to create worktree"),
+        Err(_) => Err(anyhow!("worktree creation was canceled")),
+    };
+    if let Err(error) = create_result {
+        // `create_worktree_detached` may have left a partial directory or
+        // a stale registration behind; force-remove first so the rollback
+        // rename has somewhere to put the backup back.
+        remove_new_worktree_on_error(true, &main_repo, worktree_path, cx).await;
+        rollback_backup(
+            app_state.fs.as_ref(),
+            backup.as_ref(),
+            worktree_path,
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
     let created_new_worktree = true;
 
     let (wt_repo, _temp_wt_project) =
@@ -658,6 +706,13 @@ pub async fn restore_worktree_via_git(
             Err(error) => {
                 remove_new_worktree_on_error(created_new_worktree, &main_repo, worktree_path, cx)
                     .await;
+                rollback_backup(
+                    app_state.fs.as_ref(),
+                    backup.as_ref(),
+                    worktree_path,
+                    &error,
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -758,11 +813,107 @@ pub async fn restore_worktree_via_git(
         .map_err(|_| anyhow!("restore_archive_checkpoint canceled"))
         .and_then(|r| r)
     {
+        let error = error.context("failed to restore archive checkpoint");
         remove_new_worktree_on_error(created_new_worktree, &main_repo, worktree_path, cx).await;
-        return Err(error.context("failed to restore archive checkpoint"));
+        rollback_backup(
+            app_state.fs.as_ref(),
+            backup.as_ref(),
+            worktree_path,
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
+
+    // The restore succeeded; drop the backup directory so the temporary
+    // sibling doesn't linger on disk.
+    if let Some(backup) = backup {
+        if let Err(error) = app_state
+            .fs
+            .remove_dir(
+                &backup.dir,
+                RemoveOptions {
+                    recursive: true,
+                    ignore_if_not_exists: true,
+                },
+            )
+            .await
+        {
+            log::warn!(
+                "failed to clean up backup directory '{}' after successful restore: {error:#}",
+                backup.dir.display()
+            );
+        }
     }
 
     Ok(worktree_path.clone())
+}
+
+/// Pre-existing content at `worktree_path` that was moved aside before the
+/// destructive parts of [`restore_worktree_via_git`] ran. If anything goes
+/// wrong, [`rollback_backup`] uses this to put the user's content back.
+struct Backup {
+    /// The temporary sibling directory holding the moved content.
+    dir: PathBuf,
+    /// Where inside `dir` the original entry now lives.
+    target: PathBuf,
+}
+
+/// Restores the user's pre-existing content from a backup created by
+/// [`restore_worktree_via_git`] back to `worktree_path`, then deletes the
+/// now-empty backup directory.
+///
+/// On any rollback failure we log loudly (including the original error and
+/// the backup path) so the user can recover manually, and leave the backup
+/// directory in place. The original `restore_worktree_via_git` error is the
+/// user-visible cause and is returned by the caller; we never propagate the
+/// rollback error.
+async fn rollback_backup(
+    fs: &dyn Fs,
+    backup: Option<&Backup>,
+    worktree_path: &Path,
+    original_error: &anyhow::Error,
+) {
+    let Some(backup) = backup else {
+        return;
+    };
+    if let Err(rollback_error) = fs
+        .rename(
+            &backup.target,
+            worktree_path,
+            RenameOptions {
+                overwrite: false,
+                ignore_if_exists: false,
+                create_parents: false,
+            },
+        )
+        .await
+    {
+        log::error!(
+            "failed to restore backup '{}' to '{}' after restore error: {rollback_error:#}; \
+             original restore error: {original_error:#}; \
+             user content remains at '{}' for manual recovery",
+            backup.target.display(),
+            worktree_path.display(),
+            backup.target.display(),
+        );
+        return;
+    }
+    if let Err(cleanup_error) = fs
+        .remove_dir(
+            &backup.dir,
+            RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: true,
+            },
+        )
+        .await
+    {
+        log::warn!(
+            "failed to clean up empty backup directory '{}' after rollback: {cleanup_error:#}",
+            backup.dir.display()
+        );
+    }
 }
 
 /// Returns whether restoring this archived worktree would clobber any
