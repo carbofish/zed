@@ -3072,6 +3072,32 @@ impl Sidebar {
             .await;
             if let Err(error) = result {
                 log::error!("{error:#}");
+                this.update_in(cx, |this, _window, cx| {
+                    this.restoring_tasks.remove(&thread_id);
+                    if let Some(weak_archive_view) = &weak_archive_view {
+                        weak_archive_view
+                            .update(cx, |view, cx| {
+                                view.clear_restoring(&thread_id, cx);
+                            })
+                            .ok();
+                    }
+
+                    if let Some(multi_workspace) = this.multi_workspace.upgrade() {
+                        let workspace = multi_workspace.read(cx).workspace().clone();
+                        workspace.update(cx, |workspace, cx| {
+                            struct RestoreFailedToast;
+                            workspace.show_toast(
+                                Toast::new(
+                                    NotificationId::unique::<RestoreFailedToast>(),
+                                    format!("Failed to restore thread: {error:#}"),
+                                )
+                                .autohide(),
+                                cx,
+                            );
+                        });
+                    }
+                })
+                .ok();
             }
         });
         self.restoring_tasks.insert(thread_id, restore_task);
