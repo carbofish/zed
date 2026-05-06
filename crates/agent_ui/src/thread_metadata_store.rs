@@ -493,25 +493,13 @@ pub struct RestoreGuard {
 
 impl Drop for RestoreGuard {
     fn drop(&mut self) {
-        // Spawn a detached task instead of updating synchronously, because
-        // this guard may be dropped while GPUI's application state is already
-        // mutably borrowed (e.g. during an entity update that drops a task
-        // holding the guard). A synchronous `WeakEntity::update` would
-        // re-enter `App::borrow_mut()` and panic with `BorrowMutError`.
-        let store = self.store.clone();
-        let thread_id = self.thread_id;
         let paths = std::mem::take(&mut self.paths);
-        let mut cx = self.cx.clone();
-        self.cx
-            .spawn(async move |_| {
-                store
-                    .update(&mut cx, |store, _| {
-                        store.finish_restoring(thread_id);
-                        store.finish_restoring_paths(&paths);
-                    })
-                    .ok();
+        self.store
+            .update(&mut self.cx, |store, _| {
+                store.finish_restoring(self.thread_id);
+                store.finish_restoring_paths(&paths);
             })
-            .detach();
+            .ok();
     }
 }
 
@@ -4157,7 +4145,6 @@ mod tests {
         );
 
         drop(first_guard);
-        cx.run_until_parked();
 
         cx.update(|cx| {
             assert!(
@@ -4170,7 +4157,6 @@ mod tests {
             ThreadMetadataStore::try_claim_restore(&store, thread_id, vec![], &mut async_cx)
                 .expect("a fresh claim should succeed after the previous guard was dropped");
         drop(third);
-        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -4203,7 +4189,6 @@ mod tests {
         );
 
         drop(guard_a);
-        cx.run_until_parked();
 
         let guard_b = ThreadMetadataStore::try_claim_restore(
             &store,
@@ -4213,6 +4198,5 @@ mod tests {
         )
         .expect("claim should succeed after the first guard is dropped");
         drop(guard_b);
-        cx.run_until_parked();
     }
 }
