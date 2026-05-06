@@ -702,10 +702,25 @@ pub async fn restore_worktree_via_git(
         .map_err(|_| anyhow!("worktree remove was canceled"))
         .and_then(|r| r)
     {
-        log::debug!(
-            "git worktree remove --force for '{}' failed (likely no stale registration): {error:#}",
-            worktree_path.display()
-        );
+        let error_message = format!("{error:#}");
+        if error_message.contains("not a working tree") || error_message.contains("no worktree") {
+            log::debug!(
+                "git worktree remove --force for '{}' (no stale registration): {error:#}",
+                worktree_path.display()
+            );
+        } else {
+            rollback_backup(
+                app_state.fs.as_ref(),
+                backup.as_ref(),
+                worktree_path,
+                &error,
+            )
+            .await;
+            return Err(error.context(format!(
+                "failed to remove stale worktree registration for '{}'",
+                worktree_path.display()
+            )));
+        }
     }
 
     // Create the worktree at the original commit — the branch still points
