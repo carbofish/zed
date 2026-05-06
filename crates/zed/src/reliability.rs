@@ -21,6 +21,14 @@ use crate::STARTUP_TIME;
 
 const MAX_HANG_TRACES: usize = 3;
 
+gpui::actions!(
+    dev,
+    [
+        /// Causes a performance hang to test performance monitoring
+        HangMainThread,
+    ]
+);
+
 pub fn init(client: Arc<Client>, cx: &mut App) {
     if cfg!(debug_assertions) {
         log::info!("Debug assertions enabled, skipping hang monitoring");
@@ -49,6 +57,11 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
         })
         .detach()
     }
+
+    cx.on_action(move |_: &HangMainThread, _| {
+        info!("Hanging main thread for 3 seconds to test performance monitoring! The app will be unresponsive");
+        std::thread::sleep(Duration::from_secs(3));
+    });
 
     cx.observe_new(move |project: &mut Project, _, cx| {
         let client = client.clone();

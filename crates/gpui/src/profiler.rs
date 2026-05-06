@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{SharedString, TasksIncluded};
 
+
 #[doc(hidden)]
 #[derive(Debug, Copy, Clone)]
 pub struct TaskTiming {
@@ -306,11 +307,19 @@ impl std::fmt::Display for TaskStatistics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Tasks that blocked the longest before yielding\n")?;
         for timing in self.longest_yield_times {
-            f.write_fmt(format_args!("{}:{}\n", timing.location.file(), timing.location.column()))?;
+            f.write_fmt(format_args!(
+                "{}:{}\n",
+                timing.location.file(),
+                timing.location.column()
+            ))?;
         }
         f.write_str("Tasks that did the most work before completing\n")?;
         for timing in self.longest_runtimes {
-            f.write_fmt(format_args!("{}:{}\n", timing.location.file(), timing.location.column()))?;
+            f.write_fmt(format_args!(
+                "{}:{}\n",
+                timing.location.file(),
+                timing.location.column()
+            ))?;
         }
         Ok(())
     }
