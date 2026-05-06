@@ -5598,9 +5598,7 @@ async fn test_restore_worktree_rolls_back_backup_on_failure(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-async fn test_restore_worktree_round_trips_committed_and_uncommitted_content(
-    cx: &mut TestAppContext,
-) {
+async fn test_restore_worktree_round_trips_git_admin_state(cx: &mut TestAppContext) {
     // End-to-end happy-path smoke test for `restore_worktree_via_git`:
     // plant a checkpoint, tear the worktree directory down to simulate
     // archival, then call the restore and confirm the captured tree is
