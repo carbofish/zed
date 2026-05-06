@@ -318,8 +318,8 @@ impl X11Client {
                         // callbacks.
                         handle.insert_idle(|_| {
                             let location = runnable.metadata().location;
-
-                            profiler::update_running_task(location);
+                            let spawned = runnable.metadata().spawned;
+                            profiler::update_running_task(spawned, location);
                             runnable.run();
                             profiler::save_task_timing();
                         });

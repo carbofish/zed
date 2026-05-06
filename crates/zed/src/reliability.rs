@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result};
 use client::{Client, telemetry::MINIDUMP_ENDPOINT};
 use feature_flags::FeatureFlagAppExt;
 use futures::{AsyncReadExt, TryStreamExt};
-use gpui::{App, AppContext as _, SerializedThreadTaskTimings, TaskStatistics, TasksIncluded};
+use gpui::{App, AppContext as _, SerializedThreadTaskTimings, TasksIncluded, profiler};
 use http_client::{self, AsyncBody, HttpClient, Request};
 use log::info;
 use project::Project;
@@ -192,16 +192,10 @@ fn format_task_statistics(stats: &[gpui::ThreadTaskTimings]) -> Option<String> {
     Some(res)
 }
 
-fn save_hang_trace_and_print_stats(
-    main_thread_id: ThreadId,
-    background_executor: &gpui::BackgroundExecutor,
-    hang_time: chrono::DateTime<chrono::Local>,
-) {
-    let thread_timings = background_executor
-        .dispatcher()
-        .get_all_timings(TasksIncluded::CompletedAndRunning);
-    let thread_stats = format_task_statistics(&thread_timings);
-
+fn save_traces() -> Option<()> {
+if profiler::trace_enabled() {
+    return None
+}
     let thread_timings = thread_timings
         .into_iter()
         .map(|mut timings| {
@@ -247,9 +241,23 @@ fn save_hang_trace_and_print_stats(
     std::fs::write(&trace_path, timings)
         .context("hang trace file writing")
         .log_err();
+}
+
+fn save_hang_trace_and_print_stats(
+    main_thread_id: ThreadId,
+    background_executor: &gpui::BackgroundExecutor,
+    hang_time: chrono::DateTime<chrono::Local>,
+) {
+    let thread_timings = background_executor
+        .dispatcher()
+        .get_all_timings(TasksIncluded::CompletedAndRunning);
+    let thread_stats = format_task_statistics(&thread_timings);
 
     info!("hang detected");
-    info!("task trace saved at: {}", trace_path.display());
+    if let Some(trace_path) = save_traces(){
+        info!("task trace saved at: {}", trace_path);
+    }
+
     if let Some(stats) = thread_stats {
         info!("task statistics:\n{}", stats);
     }

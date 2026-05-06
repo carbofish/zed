@@ -220,7 +220,10 @@ impl BackgroundExecutor {
 
         let (runnable, task) = unsafe {
             async_task::Builder::new()
-                .metadata(RunnableMeta { location })
+                .metadata(RunnableMeta {
+                    location,
+                    spawned: scheduler::SpawnTime(Instant::now()),
+                })
                 .spawn_unchecked(
                     move |_| async {
                         let _notify_guard = NotifyOnDrop(pair);

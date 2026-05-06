@@ -40,9 +40,10 @@ impl LinuxDispatcher {
                     .name(format!("Worker-{i}"))
                     .spawn(move || {
                         for runnable in receiver.iter() {
+                            // TODO rfactor this into one run method
                             let location = runnable.metadata().location;
-
-                            profiler::update_running_task(location);
+                            let spawned = runnable.metadata().spawned;
+                            profiler::update_running_task(spawned, location);
                             runnable.run();
                             profiler::save_task_timing();
                         }
@@ -70,7 +71,8 @@ impl LinuxDispatcher {
                                     move |_, _, _| {
                                         if let Some(runnable) = runnable.take() {
                                             let location = runnable.metadata().location;
-                                            profiler::update_running_task(location);
+                                            let spawned = runnable.metadata().spawned;
+                                            profiler::update_running_task(spawned, location);
                                             runnable.run();
                                             profiler::save_task_timing();
                                         }

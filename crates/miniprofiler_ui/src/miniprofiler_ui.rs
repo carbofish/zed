@@ -82,7 +82,7 @@ impl Settings for PerformanceProfilerSettings {
 
 pub fn init(startup_time: Instant, cx: &mut App) {
     let initial_enabled = PerformanceProfilerSettings::get_global(cx).enabled;
-    profiler::set_enabled(initial_enabled);
+    profiler::set_trace_enabled(initial_enabled);
     update_command_palette_filter(initial_enabled, cx);
 
     cx.observe_global::<SettingsStore>(|cx| {
@@ -90,7 +90,7 @@ pub fn init(startup_time: Instant, cx: &mut App) {
         // `set_enabled` reports whether the value actually changed, so skip the
         // filter update and window cleanup on the common no-op path — the
         // settings observer fires for every settings change.
-        if !profiler::set_enabled(enabled) {
+        if !profiler::set_trace_enabled(enabled) {
             return;
         }
         update_command_palette_filter(enabled, cx);
