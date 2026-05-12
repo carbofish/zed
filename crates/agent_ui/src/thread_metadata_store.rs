@@ -4342,7 +4342,7 @@ mod tests {
         let guard_b = ThreadMetadataStore::try_claim_restore(
             &store,
             thread_b,
-            vec![shared_path.clone()],
+            vec![shared_path],
             &mut async_cx,
         )
         .expect("claim should succeed after the first guard is dropped");
