@@ -5,7 +5,7 @@ use collections::{BTreeMap, HashMap};
 use context_server::{ContextServerId, client::NotificationSubscription};
 use futures::FutureExt as _;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task};
-use language_model::LanguageModelToolResultContent;
+use language_model::{LanguageModelImage, LanguageModelToolResultContent};
 use project::context_server_store::{ContextServerStatus, ContextServerStore};
 use std::sync::Arc;
 use util::ResultExt;
@@ -394,15 +394,40 @@ impl AnyAgentTool for ContextServerTool {
             }
 
             let mut llm_output = Vec::new();
+            let mut tool_call_content = Vec::new();
             let mut concatenated_text = String::new();
             for content in response.content {
                 match content {
                     context_server::types::ToolResponseContent::Text { text } => {
                         concatenated_text.push_str(&text);
+                        tool_call_content.push(acp::ToolCallContent::Content(acp::Content::new(
+                            acp::ContentBlock::Text(acp::TextContent::new(text.clone())),
+                        )));
                         llm_output.push(LanguageModelToolResultContent::Text(text.into()));
                     }
-                    context_server::types::ToolResponseContent::Image { .. } => {
-                        log::warn!("Ignoring image content from tool response");
+                    context_server::types::ToolResponseContent::Image { data, mime_type } => {
+                        tool_call_content.push(acp::ToolCallContent::Content(acp::Content::new(
+                            acp::ContentBlock::Image(acp::ImageContent::new(
+                                data.clone(),
+                                mime_type.clone(),
+                            )),
+                        )));
+                        match encode_as_bas64_png(data, &mime_type) {
+                            Ok(data) => {
+                                llm_output.push(LanguageModelToolResultContent::Image(
+                                    LanguageModelImage {
+                                        source: data.into(),
+                                    },
+                                ));
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "Failed to convert MCP tool response image with MIME type `{}` to PNG: {:#}",
+                                    mime_type,
+                                    error
+                                );
+                            }
+                        }
                     }
                     context_server::types::ToolResponseContent::Audio { .. } => {
                         log::warn!("Ignoring audio content from tool response");
@@ -414,6 +439,10 @@ impl AnyAgentTool for ContextServerTool {
                         log::warn!("Ignoring resource link content from tool response");
                     }
                 }
+            }
+            if !tool_call_content.is_empty() {
+                event_stream
+                    .update_fields(acp::ToolCallUpdateFields::new().content(tool_call_content));
             }
             let raw_output = serde_json::Value::String(concatenated_text);
             Ok(AgentToolOutput {
@@ -431,6 +460,43 @@ impl AnyAgentTool for ContextServerTool {
         _cx: &mut App,
     ) -> Result<()> {
         Ok(())
+    }
+}
+
+fn encode_as_bas64_png(data: String, mime_type: &str) -> Result<String> {
+    if mime_type == "image/png" {
+        return Ok(data);
+    }
+
+    let image_format = image_format_for_mime_type(mime_type)
+        .ok_or_else(|| anyhow::anyhow!("unsupported image MIME type `{}`", mime_type))?;
+    let bytes = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(data.as_bytes())?
+    };
+    let image = image::load_from_memory_with_format(&bytes, image_format)?;
+
+    let mut png_bytes = Vec::new();
+    image.write_to(
+        &mut std::io::Cursor::new(&mut png_bytes),
+        image::ImageFormat::Png,
+    )?;
+
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png_bytes))
+}
+
+fn image_format_for_mime_type(mime_type: &str) -> Option<image::ImageFormat> {
+    match gpui::ImageFormat::from_mime_type(mime_type)? {
+        gpui::ImageFormat::Png => Some(image::ImageFormat::Png),
+        gpui::ImageFormat::Jpeg => Some(image::ImageFormat::Jpeg),
+        gpui::ImageFormat::Webp => Some(image::ImageFormat::WebP),
+        gpui::ImageFormat::Gif => Some(image::ImageFormat::Gif),
+        gpui::ImageFormat::Bmp => Some(image::ImageFormat::Bmp),
+        gpui::ImageFormat::Tiff => Some(image::ImageFormat::Tiff),
+        gpui::ImageFormat::Ico => Some(image::ImageFormat::Ico),
+        gpui::ImageFormat::Pnm => Some(image::ImageFormat::Pnm),
+        gpui::ImageFormat::Svg => None,
     }
 }
 
@@ -470,6 +536,36 @@ pub fn get_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_png_image_data_for_language_model_passes_png_through() {
+        let png_data = "png-data".to_string();
+        assert_eq!(
+            encode_as_bas64_png(png_data.clone(), "image/png").unwrap(),
+            png_data
+        );
+    }
+
+    #[test]
+    fn test_png_image_data_for_language_model_converts_jpeg_to_png() {
+        use base64::Engine as _;
+        use image::ImageEncoder as _;
+
+        let mut jpeg_bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg_bytes)
+            .write_image(&[255, 0, 0], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let jpeg_data = base64::engine::general_purpose::STANDARD.encode(jpeg_bytes);
+
+        let png_data = encode_as_bas64_png(jpeg_data, "image/jpeg").unwrap();
+        let png_bytes = base64::engine::general_purpose::STANDARD
+            .decode(png_data.as_bytes())
+            .unwrap();
+        assert_eq!(
+            image::guess_format(&png_bytes).unwrap(),
+            image::ImageFormat::Png
+        );
+    }
 
     #[test]
     fn test_mcp_tool_id_format() {
