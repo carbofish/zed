@@ -97,15 +97,15 @@ Step-by-step instructions for the agent...
 
 #### Frontmatter fields {#frontmatter-fields}
 
-| Field | Required | Description |
-|---|---|---|
-| `name` | Yes | Lowercase letters, numbers, and hyphens only. Max 64 characters. Must match the folder name. |
-| `description` | Yes | What the skill does and when to use it. Max 1024 characters. |
-| `disable-model-invocation` | No | Set to `true` to hide from the agent's catalog (slash command only). |
-| `license` | No | License name or path to a bundled license file. |
-| `compatibility` | No | Environment requirements (tools, OS, network access, etc.). Max 500 characters. |
-| `metadata` | No | Arbitrary key-value map for additional properties. |
-| `allowed-tools` | No | Space-separated list of pre-approved tools. Experimental. Zed parses this field but does not yet enforce it. |
+| Field                      | Required | Description                                                                                                  |
+| -------------------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `name`                     | Yes      | Lowercase letters, numbers, and hyphens only. Max 64 characters. Must match the folder name.                 |
+| `description`              | Yes      | What the skill does and when to use it. Max 1024 characters.                                                 |
+| `disable-model-invocation` | No       | Set to `true` to hide from the agent's catalog (slash command only).                                         |
+| `license`                  | No       | License name or path to a bundled license file.                                                              |
+| `compatibility`            | No       | Environment requirements (tools, OS, network access, etc.). Max 500 characters.                              |
+| `metadata`                 | No       | Arbitrary key-value map for additional properties.                                                           |
+| `allowed-tools`            | No       | Space-separated list of pre-approved tools. Experimental. Zed parses this field but does not yet enforce it. |
 
 > **Tip:** Write descriptions that help the agent recognize when a skill is relevant. Include specific task types and trigger phrases: "Use when handling PDFs, extracting text, or filling forms" is better than "Helps with PDFs."
 
@@ -147,9 +147,9 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 
 Zed loads skills from two locations:
 
-| Scope | Path | When it applies |
-|---|---|---|
-| Global | `~/.agents/skills/` | Every project |
+| Scope         | Path                         | When it applies          |
+| ------------- | ---------------------------- | ------------------------ |
+| Global        | `~/.agents/skills/`          | Every project            |
 | Project-local | `<worktree>/.agents/skills/` | Only the current project |
 
 Each skill is a direct child of the skills root. Nesting skills inside subfolders is not supported.
